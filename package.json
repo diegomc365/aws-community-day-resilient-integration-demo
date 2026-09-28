@@ -1,0 +1,27 @@
+{
+  "name": "resilient-integration-demo",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "overrides": {
+    "@nestjs/common": "12.1.0",
+    "@nestjs/core": "12.1.0",
+    "@nestjs/platform-express": "12.1.0"
+  },
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "node --import tsx --test --test-force-exit apps/integration-service/test/*.test.ts apps/external-api/src/*.spec.ts",
+    "demo:start": "node --import tsx scripts/demo-start.ts",
+    "demo:retry": "node --import tsx scripts/demo-retry.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  }
+}

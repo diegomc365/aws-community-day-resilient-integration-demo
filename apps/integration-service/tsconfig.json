@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "../../dist/integration-service",
+    "declaration": false
+  },
+  "include": ["src/**/*.ts"]
+}

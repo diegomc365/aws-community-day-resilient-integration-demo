@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-demo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-demo_local_only}
+      POSTGRES_DB: ${POSTGRES_DB:-integration_demo}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-demo} -d ${POSTGRES_DB:-integration_demo}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  external-api:
+    build:
+      context: .
+      dockerfile: apps/external-api/Dockerfile
+    environment:
+      PORT: 3001
+    ports:
+      - "${EXTERNAL_API_PORT:-3001}:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  integration-service:
+    build:
+      context: .
+      dockerfile: apps/integration-service/Dockerfile
+    environment:
+      PORT: 3000
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_USER: ${POSTGRES_USER:-demo}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-demo_local_only}
+      DATABASE_NAME: ${POSTGRES_DB:-integration_demo}
+      EXTERNAL_API_URL: http://external-api:3001
+    ports:
+      - "${INTEGRATION_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      external-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  postgres_data:
