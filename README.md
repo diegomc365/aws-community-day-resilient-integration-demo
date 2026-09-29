@@ -18,7 +18,7 @@ flowchart LR
 - **integration-service** ejecuta los pasos, persiste la operación y sus eventos, y clasifica los fallos.
 - **external-api** simula un servicio externo. Sus respuestas de creación y confirmación pueden configurarse de forma independiente para provocar el escenario.
 - **PostgreSQL** conserva el estado necesario para continuar y reconstruir cada intento.
-- **Docker Compose** levanta los tres servicios. El contenedor de `integration-service` queda preparado para empaquetarse después para ECR y ECS Fargate; este proyecto no despliega recursos en AWS.
+- **Docker Compose** levanta los tres servicios. El contenedor de `integration-service` también puede empaquetarse para ECR y ECS Fargate; este proyecto no crea recursos en AWS por sí solo.
 
 ## Requisitos
 
@@ -124,6 +124,10 @@ docker compose down
 
 Los tests cubren el flujo fallido, el retry manual, la conservación de **EXT-78432**, la ausencia de una segunda creación externa, el error funcional y la repetición del escenario inicial. `docker compose down` detiene los servicios. Para empezar también con un volumen PostgreSQL nuevo, usa `docker compose down -v`.
 
+## AWS deployment
+
+La **demo local** conserva el recorrido completo de resiliencia con PostgreSQL y la API externa en Docker Compose. La fase de **AWS deployment** prepara solamente la imagen de `integration-service` para ECR y ECS Fargate. Consulta [AWS-DEPLOYMENT.md](./AWS-DEPLOYMENT.md) para construirla, publicarla y revisar sus requisitos. La task necesita un PostgreSQL alcanzable antes de poder arrancar y responder `/health`; esta fase no lo despliega.
+
 ## Estructura
 
 ```text
@@ -136,6 +140,7 @@ scripts/
 docker-compose.yml       # Servicios y healthchecks
 .env.example             # Variables de entorno locales de ejemplo
 DEMO-SPEC.md             # Reglas funcionales del escenario
+AWS-DEPLOYMENT.md        # Preparación y guía de despliegue a ECR/ECS
 ```
 
-El código y la demostración usan únicamente datos ficticios. El alcance de esta versión es local; el despliegue en AWS queda para una etapa posterior.
+El código y la demostración usan únicamente datos ficticios. La demo funcional continúa siendo local; los archivos AWS preparan un despliegue posterior que requiere autorización y acceso a PostgreSQL.
