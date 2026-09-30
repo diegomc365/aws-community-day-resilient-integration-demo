@@ -1,0 +1,36 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EcrAuthentication",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "PullDemoImages",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage"
+      ],
+      "Resource": [
+        "arn:aws:ecr:${AWS_REGION}:${AWS_ACCOUNT_ID}:repository/${INTEGRATION_ECR_REPOSITORY}",
+        "arn:aws:ecr:${AWS_REGION}:${AWS_ACCOUNT_ID}:repository/${EXTERNAL_ECR_REPOSITORY}"
+      ]
+    },
+    {
+      "Sid": "WriteDemoLogs",
+      "Effect": "Allow",
+      "Action": [ "logs:CreateLogStream", "logs:PutLogEvents" ],
+      "Resource": "arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:${LOG_GROUP}:log-stream:*"
+    },
+    {
+      "Sid": "ReadDemoPostgresPassword",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "${POSTGRES_PASSWORD_SECRET_ARN}"
+    }
+  ]
+}

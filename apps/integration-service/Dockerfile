@@ -22,8 +22,9 @@ ENV NO_COLOR=1
 WORKDIR /app
 COPY --from=production-deps --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist/integration-service ./dist
+COPY --chown=node:node apps/integration-service/healthcheck.cjs ./healthcheck.cjs
 USER node
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:' + process.env.PORT + '/health', { signal: AbortSignal.timeout(4000) }).then(response => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1));"
+  CMD ["node", "healthcheck.cjs"]
 CMD ["node", "dist/main.js"]

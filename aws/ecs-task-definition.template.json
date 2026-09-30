@@ -1,50 +1,75 @@
 {
   "family": "resilient-integration-task",
-  "requiresCompatibilities": ["FARGATE"],
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
   "networkMode": "awsvpc",
   "runtimePlatform": {
     "operatingSystemFamily": "LINUX",
     "cpuArchitecture": "ARM64"
   },
-  "cpu": "256",
-  "memory": "1024",
+  "cpu": "512",
+  "memory": "2048",
   "executionRoleArn": "${EXECUTION_ROLE_ARN}",
   "taskRoleArn": "${TASK_ROLE_ARN}",
+  "volumes": [
+    {
+      "name": "postgres-data"
+    }
+  ],
   "containerDefinitions": [
     {
-      "name": "integration-service",
-      "image": "${IMAGE_URI}",
+      "name": "postgres",
+      "image": "${POSTGRES_IMAGE}",
       "essential": true,
-      "portMappings": [
-        {
-          "containerPort": 3000,
-          "hostPort": 3000,
-          "protocol": "tcp"
-        }
-      ],
+      "cpu": 128,
+      "memory": 768,
+      "memoryReservation": 256,
       "environment": [
-        { "name": "NODE_ENV", "value": "production" },
-        { "name": "PORT", "value": "3000" },
-        { "name": "DATABASE_HOST", "value": "${DATABASE_HOST}" },
-        { "name": "DATABASE_PORT", "value": "${DATABASE_PORT}" },
-        { "name": "DATABASE_NAME", "value": "${DATABASE_NAME}" },
-        { "name": "DATABASE_USER", "value": "${DATABASE_USER}" },
-        { "name": "EXTERNAL_API_URL", "value": "${EXTERNAL_API_URL}" }
+        {
+          "name": "POSTGRES_USER",
+          "value": "${POSTGRES_USER}"
+        },
+        {
+          "name": "POSTGRES_DB",
+          "value": "${POSTGRES_DB}"
+        },
+        {
+          "name": "POSTGRES_INITDB_ARGS",
+          "value": "--auth-host=scram-sha-256"
+        },
+        {
+          "name": "PGUSER",
+          "value": "${POSTGRES_USER}"
+        },
+        {
+          "name": "PGDATABASE",
+          "value": "${POSTGRES_DB}"
+        }
       ],
       "secrets": [
         {
-          "name": "DATABASE_PASSWORD",
-          "valueFrom": "${DATABASE_PASSWORD_SECRET_ARN}"
+          "name": "POSTGRES_PASSWORD",
+          "valueFrom": "${POSTGRES_PASSWORD_SECRET_ARN}"
+        }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "postgres-data",
+          "containerPath": "/var/lib/postgresql/data",
+          "readOnly": false
         }
       ],
       "healthCheck": {
         "command": [
           "CMD",
-          "node",
-          "-e",
-          "fetch('http://127.0.0.1:' + process.env.PORT + '/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
+          "pg_isready",
+          "-h",
+          "127.0.0.1",
+          "-p",
+          "5432"
         ],
-        "interval": 30,
+        "interval": 5,
         "timeout": 5,
         "retries": 3,
         "startPeriod": 60
@@ -54,9 +79,144 @@
         "options": {
           "awslogs-group": "${LOG_GROUP}",
           "awslogs-region": "${AWS_REGION}",
-          "awslogs-stream-prefix": "ecs"
+          "awslogs-stream-prefix": "postgres",
+          "mode": "non-blocking",
+          "max-buffer-size": "1m"
         }
       },
+      "startTimeout": 120,
+      "stopTimeout": 30
+    },
+    {
+      "name": "external-api",
+      "image": "${EXTERNAL_IMAGE_URI}",
+      "essential": true,
+      "cpu": 64,
+      "memory": 256,
+      "memoryReservation": 128,
+      "environment": [
+        {
+          "name": "NODE_ENV",
+          "value": "production"
+        },
+        {
+          "name": "PORT",
+          "value": "3001"
+        }
+      ],
+      "dependsOn": [
+        {
+          "containerName": "postgres",
+          "condition": "HEALTHY"
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:' + process.env.PORT + '/health', { signal: AbortSignal.timeout(4000) }).then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
+        ],
+        "interval": 10,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "${LOG_GROUP}",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "external",
+          "mode": "non-blocking",
+          "max-buffer-size": "1m"
+        }
+      },
+      "startTimeout": 120,
+      "stopTimeout": 30
+    },
+    {
+      "name": "integration-service",
+      "image": "${INTEGRATION_IMAGE_URI}",
+      "essential": true,
+      "cpu": 256,
+      "memory": 768,
+      "memoryReservation": 256,
+      "portMappings": [
+        {
+          "containerPort": 3000,
+          "hostPort": 3000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "NODE_ENV",
+          "value": "production"
+        },
+        {
+          "name": "PORT",
+          "value": "3000"
+        },
+        {
+          "name": "DATABASE_HOST",
+          "value": "127.0.0.1"
+        },
+        {
+          "name": "DATABASE_PORT",
+          "value": "5432"
+        },
+        {
+          "name": "DATABASE_NAME",
+          "value": "${POSTGRES_DB}"
+        },
+        {
+          "name": "DATABASE_USER",
+          "value": "${POSTGRES_USER}"
+        },
+        {
+          "name": "EXTERNAL_API_URL",
+          "value": "http://127.0.0.1:3001"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "DATABASE_PASSWORD",
+          "valueFrom": "${POSTGRES_PASSWORD_SECRET_ARN}"
+        }
+      ],
+      "dependsOn": [
+        {
+          "containerName": "postgres",
+          "condition": "HEALTHY"
+        },
+        {
+          "containerName": "external-api",
+          "condition": "HEALTHY"
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD",
+          "node",
+          "healthcheck.cjs"
+        ],
+        "interval": 10,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "${LOG_GROUP}",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "integration",
+          "mode": "non-blocking",
+          "max-buffer-size": "1m"
+        }
+      },
+      "startTimeout": 120,
       "stopTimeout": 30
     }
   ]

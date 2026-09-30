@@ -1,0 +1,81 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    platform: linux/arm64
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-demo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD for this temporary demo}
+      POSTGRES_DB: ${POSTGRES_DB:-integration_demo}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      PGUSER: ${POSTGRES_USER:-demo}
+      PGDATABASE: ${POSTGRES_DB:-integration_demo}
+    ports:
+      - "127.0.0.1:13000:3000"
+      - "127.0.0.1:13001:3001"
+    volumes:
+      - /var/lib/postgresql/data
+    cpu_shares: 128
+    mem_limit: 768m
+    mem_reservation: 256m
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "5432"]
+      interval: 5s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  external-api:
+    image: ${EXTERNAL_ECR_REPOSITORY:-aws-community-day-external-api}:${IMAGE_TAG:?Set IMAGE_TAG explicitly}
+    build:
+      context: ..
+      dockerfile: apps/external-api/Dockerfile
+    platform: linux/arm64
+    network_mode: service:postgres
+    environment:
+      NODE_ENV: production
+      NO_COLOR: "1"
+      PORT: "3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    cpu_shares: 64
+    mem_limit: 256m
+    mem_reservation: 128m
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:' + process.env.PORT + '/health', {signal: AbortSignal.timeout(4000)}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  integration-service:
+    image: ${INTEGRATION_ECR_REPOSITORY:-aws-community-day-resilient-integration}:${IMAGE_TAG:?Set IMAGE_TAG explicitly}
+    build:
+      context: ..
+      dockerfile: apps/integration-service/Dockerfile
+    platform: linux/arm64
+    network_mode: service:postgres
+    environment:
+      NODE_ENV: production
+      NO_COLOR: "1"
+      PORT: "3000"
+      DATABASE_HOST: 127.0.0.1
+      DATABASE_PORT: "5432"
+      DATABASE_USER: ${POSTGRES_USER:-demo}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD for this temporary demo}
+      DATABASE_NAME: ${POSTGRES_DB:-integration_demo}
+      EXTERNAL_API_URL: http://127.0.0.1:3001
+    depends_on:
+      postgres:
+        condition: service_healthy
+      external-api:
+        condition: service_healthy
+    cpu_shares: 256
+    mem_limit: 768m
+    mem_reservation: 256m
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.cjs"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 3

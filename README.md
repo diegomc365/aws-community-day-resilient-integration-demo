@@ -126,7 +126,11 @@ Los tests cubren el flujo fallido, el retry manual, la conservación de **EXT-78
 
 ## AWS deployment
 
-La **demo local** conserva el recorrido completo de resiliencia con PostgreSQL y la API externa en Docker Compose. La fase de **AWS deployment** prepara solamente la imagen de `integration-service` para ECR y ECS Fargate. Consulta [AWS-DEPLOYMENT.md](./AWS-DEPLOYMENT.md) para construirla, publicarla y revisar sus requisitos. La task necesita un PostgreSQL alcanzable antes de poder arrancar y responder `/health`; esta fase no lo despliega.
+La fase **AWS 2B** propone una task ECS Fargate con los tres contenedores: `integration-service`, `external-api` y PostgreSQL oficial `postgres:16-alpine`. Usa Linux ARM64, 0,5 vCPU, 2 GiB y `awsvpc`; los servicios se comunican por `127.0.0.1` dentro de la task. Los healthchecks exigen que los tres estén saludables y que integración pueda ejecutar `SELECT 1` autenticada en PostgreSQL.
+
+**PostgreSQL es efímero y exclusivo de esta demostración temporal.** Sus datos desaparecen al destruir o reemplazar la task. La persistencia productiva deberá evaluarse por separado; no se implementa en esta fase. La presentación sigue usando la demo local y sus dos comandos originales.
+
+Consulta [AWS-DEPLOYMENT.md](./AWS-DEPLOYMENT.md) para el inventario, IAM, secreto, red sin ingress, costos y comandos futuros. La configuración [aws/docker-compose.task-demo.yml](./aws/docker-compose.task-demo.yml) permite validar localmente las imágenes y la red compartida equivalentes. Dos repositorios ECR guardarán las imágenes propias con tags inmutables `demo-<SHA8>`. Esta fase prepara y valida archivos; la creación de recursos y publicación de imágenes esperan autorización.
 
 ## Estructura
 
@@ -143,4 +147,4 @@ DEMO-SPEC.md             # Reglas funcionales del escenario
 AWS-DEPLOYMENT.md        # Preparación y guía de despliegue a ECR/ECS
 ```
 
-El código y la demostración usan únicamente datos ficticios. La demo funcional continúa siendo local; los archivos AWS preparan un despliegue posterior que requiere autorización y acceso a PostgreSQL.
+El código y la demostración usan únicamente datos ficticios. La demo principal continúa siendo local; los archivos AWS preparan un despliegue posterior que requiere autorización.

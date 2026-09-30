@@ -1,265 +1,456 @@
-# AWS readiness: ECR y ECS Fargate
+# AWS 2B: propuesta de demo temporal en ECS Fargate
 
-Esta guía prepara **solo `integration-service`** para publicar su imagen en Amazon ECR y, cuando sus dependencias estén disponibles, ejecutarla en ECS Fargate. La demo de resiliencia completa (`npm run demo:start` y `npm run demo:retry`) sigue en Docker Compose local. Los comandos que crean o eliminan recursos son **para una fase posterior**: no se han ejecutado ni se han creado recursos AWS durante esta preparación.
+Esta fase prepara una task con **integration-service, external-api y PostgreSQL**. Se validan las imágenes y una configuración equivalente localmente; el discovery AWS es de solo lectura. **Los comandos de creación, publicación y eliminación son futuros y requieren autorización.** No implican que el entorno ya esté desplegado.
 
-## 1. Arquitectura y límite de esta fase
+La presentación principal sigue usando el MVP local sin cambiar su lógica ni sus comandos:
+
+```bash
+npm run demo:start
+npm run demo:retry
+```
+
+AWS servirá como evidencia de ejecución de los mismos servicios en contenedores administrados. Las operaciones, eventos, estados, idempotencia, clasificación de errores y retry manual permanecen iguales.
+
+## 1. Arquitectura y alcance
 
 ```mermaid
 flowchart TB
-    Developer --> Docker
-    Docker --> ECR[Amazon ECR]
-    ECR --> ECS[Amazon ECS]
-    ECS --> Fargate[AWS Fargate]
-    Fargate --> Integration[Integration Service]
-    Integration --> Logs[CloudWatch Logs]
+    ECR1["ECR: integration-service"] --> I
+    ECR2["ECR: external-api"] --> E
+    HUB["Docker Hub: PostgreSQL oficial"] --> P
+    SM["Secrets Manager: password de demo"] --> I
+    SM --> P
+    subgraph Task["ECS Fargate · misma task · Linux ARM64 · awsvpc"]
+        I["integration-service :3000"] -->|"127.0.0.1:5432"| P[("postgres :5432")]
+        I -->|"http://127.0.0.1:3001"| E["external-api :3001"]
+        P --> DISK["Volumen efímero postgres-data"]
+    end
+    I --> CW[CloudWatch Logs]
+    E --> CW
+    P --> CW
 ```
 
-La imagen es la misma implementación NestJS de la demo local. La task propuesta usa Linux/ARM64, `256` unidades de CPU (0,25 vCPU), `1024` MiB de memoria, un contenedor y puerto `3000`. Es una [combinación válida de Fargate](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-tasks-services.html) y un punto inicial pequeño; habrá que medir memoria y CPU antes de considerarlo un dimensionamiento definitivo. El host de desarrollo y Docker son ARM64, por lo que se construye `linux/arm64` sin emulación. [Fargate soporta ARM64 en Linux con plataforma 1.4.0 o posterior](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-arm64.html); confirmar la disponibilidad en la región y zona de disponibilidad elegidas.
+Los contenedores de una task `awsvpc` comparten red y [pueden comunicarse mediante localhost](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-task-networking.html). Se fijan `DATABASE_HOST=127.0.0.1`, `DATABASE_PORT=5432` y `EXTERNAL_API_URL=http://127.0.0.1:3001`. Cada proceso escucha en un puerto distinto.
 
-**Límite de arranque:** `integration-service` exige todas las variables de PostgreSQL y `TypeOrmModule.forRoot()` intenta conectarse antes de que NestJS escuche el puerto. Sin un PostgreSQL **realmente alcanzable desde la task**, el proceso no llega a servir `/health` y Fargate no puede marcarla saludable. `postgres` es un nombre DNS de Docker Compose, no de AWS; `localhost` dentro de Fargate apunta a la propia task. En esta fase no se instala PostgreSQL/RDS ni se agrega un bypass. El constructor de `ExternalApiClient` también exige `EXTERNAL_API_URL` no vacía al arrancar, aunque solo comprueba la conectividad al ejecutar operaciones. `external-api` no se despliega en AWS, así que una task saludable tampoco demostraría integración con ella. **Publicar en ECR sí es independiente; ejecutar una task saludable queda condicionado al acceso aprobado a una base aislada y a configurar una URL externa explícita.** No presentar esa prueba como una demo funcional de resiliencia end-to-end.
+**PostgreSQL dentro de Fargate es exclusivo de esta demo temporal.** El volumen `postgres-data` se monta en `/var/lib/postgresql/data`, sin `host.sourcePath`, EFS ni almacenamiento externo. Fargate [admite bind mounts efímeros](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/specify-bind-mount-config.html); se conserva el disco por defecto de [20 GiB de la task](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-task-storage.html), usado también por las imágenes. Al destruir o reemplazar la task se pierden operaciones, eventos y datos PostgreSQL. No hay backups ni snapshots.
 
-## 2. Prerrequisitos y recursos propuestos
+Para producción, durabilidad, disponibilidad y recuperación de la base deben evaluarse de forma independiente mediante un servicio apropiado. Esta fase no diseña ni implementa esa arquitectura. La demo temporal no demuestra recuperación después de perder la task.
 
-Se necesitan Docker, Node.js 22, AWS CLI v2, `jq`, `envsubst`, credenciales AWS con permisos acotados para la fase de creación y una VPC/subnet/security group **existentes**. No se crean VPC, NAT, ALB, RDS, external-api ni otros componentes fuera de alcance. Verificar identidad y región con comandos de solo lectura:
+El alcance continúa sin RDS, ALB, Service Discovery, Route 53, API Gateway, Auto Scaling, NAT Gateway, VPC nueva, SQS, EventBridge, Lambda, Step Functions, Terraform, CloudFormation, CDK ni CI/CD.
+
+## 2. Task y recursos
+
+La definición final propuesta está en [aws/ecs-task-definition.template.json](aws/ecs-task-definition.template.json).
+
+| Propiedad | Propuesta |
+| --- | --- |
+| Family / launch type | `resilient-integration-task` / `FARGATE` |
+| Sistema / arquitectura | Linux / `ARM64` |
+| Red | `awsvpc` |
+| Task CPU / memoria | `512` unidades, 0,5 vCPU / `2048` MiB, 2 GiB |
+| Plataforma Fargate | `1.4.0` |
+| Contenedores esenciales | Los tres, con healthcheck explícito |
+| Disco | 20 GiB efímeros por defecto; volumen `postgres-data` |
+| Task role | Omitido mientras el código no llame a AWS |
+| Execution role | `resilient-integration-execution-role` |
+
+| Contenedor | CPU relativa | Memoria reservada | Límite de memoria |
+| --- | --- | --- | --- |
+| `integration-service` | 256 | 256 MiB | 768 MiB |
+| `external-api` | 64 | 128 MiB | 256 MiB |
+| `postgres` | 128 | 256 MiB | 768 MiB |
+| Suma | 448 | 640 MiB | 1792 MiB |
+
+CPU de contenedor define peso relativo dentro de la task; `memoryReservation` es el umbral flexible y `memory` el límite duro. Las sumas dejan margen dentro de 512/2048. Es un dimensionamiento inicial para el pequeño escenario de demo; medir durante arranque y escenario y comprobar ausencia de OOM antes de fijarlo definitivamente. Una muestra local no representa una prueba de carga.
+
+La validación equivalente local registró aproximadamente 52 / 39,6 / 29,8 MiB en reposo y máximos de cgroup de 78,5 / 57,7 / 82,4 MiB para integración / API externa / PostgreSQL. La suma de máximos individuales es aproximadamente 219 MiB; no es un pico simultáneo medido. Los valores respaldan un tamaño inicial pequeño con margen, sin justificar capacidad productiva.
+
+La combinación [0,5 vCPU / 2 GiB es válida en Fargate](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html). [ARM64 exige Linux y plataforma 1.4.0 o posterior](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-arm64.html). En `us-east-1`, excluir la **AZ ID `use1-az3`**; usar IDs de zona, porque sus nombres varían por cuenta. Si una imagen falla por incompatibilidad ARM64, detener la preparación; no cambiar automáticamente a X86_64.
+
+## 3. Imágenes y tags
+
+| Contenedor | Imagen |
+| --- | --- |
+| integration-service | ECR privado `aws-community-day-resilient-integration:demo-<SHA8>` |
+| external-api | ECR privado `aws-community-day-external-api:demo-<SHA8>` |
+| postgres | Oficial `postgres:16-alpine`, PostgreSQL 16.15, validada `linux/arm64` |
+
+Los Dockerfiles propios usan Node 22, varias etapas, dependencias de producción, usuario `node`, healthcheck y stdout/stderr. PostgreSQL conserva el entrypoint oficial y su manejo de permisos. El digest público validado es `sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea`; se fija en `POSTGRES_IMAGE` para repetir esa imagen.
+
+Ambos repositorios ECR serán **IMMUTABLE**, con `scanOnPush=true` y cifrado `AES256`. Las imágenes propias usarán `demo-<SHORT_GIT_SHA>`, con los ocho primeros caracteres del commit, sin depender de `latest`. Reconstruir después de confirmar cambios. El script de push exige checkout limpio, tag exacto y etiquetas `org.opencontainers.image.revision=<SHA completo>` y `demo.source-clean=true`.
+
+El pull público de PostgreSQL depende de Docker Hub y sus [límites de uso](https://docs.docker.com/docker-hub/usage/). Un rate limit puede impedir el arranque. No se agrega un repositorio PostgreSQL ni credenciales de registro en esta propuesta; reevaluar si ocurre ese límite.
+
+## 4. Healthchecks y dependencias
+
+```text
+postgres HEALTHY
+    ↓
+external-api START → HEALTHY
+    ↓
+integration-service START → HEALTHY
+```
+
+`external-api` depende de `postgres:HEALTHY`; `integration-service` depende de **ambos** con condición `HEALTHY`. ECS [comprueba estas dependencias durante el arranque y revierte el orden al detener](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_ContainerDependency.html). No se usan sleeps arbitrarios. La dependencia no supervisa por sí sola fallos posteriores; los healthchecks siguen haciéndolo.
+
+Los tres contenedores declaran `startTimeout=120` y `stopTimeout=30`. El plazo de arranque se configura también en PostgreSQL, la dependencia que debe alcanzar `HEALTHY`; `startPeriod` del healthcheck no sustituye ese plazo. [Definición de startTimeout](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_ContainerDefinition.html#ECS-Type-ContainerDefinition-startTimeout).
+
+| Contenedor | Healthcheck |
+| --- | --- |
+| postgres | `pg_isready -h 127.0.0.1 -p 5432`, con usuario/base configurados. TCP evita dar por saludable el servidor temporal de inicialización que solo escucha por socket Unix. |
+| external-api | Node consulta `http://127.0.0.1:3001/health`, exige HTTP exitoso y limita el tiempo de espera. |
+| integration-service | `node /app/healthcheck.cjs`: exige HTTP exitoso de `/health` y conexión autenticada a PostgreSQL que ejecute `SELECT 1` con las mismas variables `DATABASE_*`. |
+
+No se altera `/health` ni se omite TypeORM. El chequeo de imagen confirma acceso actual a la base aunque el HTTP siga abierto después de una caída. Los comandos y tiempos están en la Task Definition. [ECS determina la salud mediante contenedores esenciales con healthcheck declarado](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/healthcheck.html); la task solo estará `HEALTHY` cuando los tres lo estén. Ningún healthcheck ejecuta retries de negocio.
+
+PostgreSQL recibe `POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256` para exigir password en conexiones TCP a loopback. Esto se aplica al inicializar una base vacía; reutilizar un volumen ya inicializado no cambia su `pg_hba.conf`. La prueba local confirmó `SELECT 1` exitoso con el password correcto y healthcheck fallido con uno incorrecto. La autenticación local por socket del entrypoint oficial no se comparte con los servicios de la task.
+
+## 5. Validación local equivalente
+
+Requisitos: Docker con Compose, Node 22, npm y `openssl`. Ejecutar desde la raíz en Bash; si hace falta, cargar nvm y ejecutar `nvm use 22`. El `docker-compose.yml` original conserva la demo principal.
+
+Construir las dos imágenes, sin AWS:
+
+```bash
+IMAGE_TAG=local-2b bash scripts/aws/build-image.sh all
+export POSTGRES_IMAGE=postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+docker pull --platform linux/arm64 "$POSTGRES_IMAGE"
+docker image inspect --format '{{.Os}}/{{.Architecture}}' \
+  aws-community-day-resilient-integration:local-2b \
+  aws-community-day-external-api:local-2b "$POSTGRES_IMAGE"
+```
+
+`local-2b` permite probar cambios antes del commit; no es publicable. [aws/docker-compose.task-demo.yml](aws/docker-compose.task-demo.yml) comparte el namespace de PostgreSQL mediante `network_mode: service:postgres`. Los servicios usan loopback, variables y healthchecks equivalentes. Solo publica al host local `127.0.0.1:13000` y `127.0.0.1:13001`; no publica PostgreSQL. Se exige password por environment:
+
+```bash
+export IMAGE_TAG=local-2b
+export POSTGRES_PASSWORD="$(openssl rand -hex 32)"
+docker compose -p resilient-task-demo -f aws/docker-compose.task-demo.yml \
+  up -d --no-build --wait --wait-timeout 180
+docker compose -p resilient-task-demo -f aws/docker-compose.task-demo.yml ps
+INTEGRATION_URL=http://127.0.0.1:13000 EXTERNAL_API_URL=http://127.0.0.1:13001 npm run demo:start
+INTEGRATION_URL=http://127.0.0.1:13000 EXTERNAL_API_URL=http://127.0.0.1:13001 npm run demo:retry
+curl --fail http://127.0.0.1:13001/admin/stats
+npm test
+docker stats --no-stream
+```
+
+Esperar `FAILED_RETRYABLE` en intento 1, luego `FINISHED` en intento 2, misma `EXT-78432`, `createCalls=1`, `confirmCalls=2` y `transactionsCreated=1`. Los scripts reciben las URLs mediante variables ya existentes. Repetir `demo:start` debe reconstruir el estado determinista. Comprobar también `BUSINESS_ERROR` → `FAILED_BUSINESS` y retry HTTP 409.
+
+Comprobar la dependencia real deteniendo PostgreSQL: el healthcheck de integración debe terminar con código distinto de cero, incluso si el proceso HTTP sigue vivo:
+
+```bash
+docker compose -p resilient-task-demo -f aws/docker-compose.task-demo.yml stop postgres
+docker compose -p resilient-task-demo -f aws/docker-compose.task-demo.yml \
+  exec -T integration-service node /app/healthcheck.cjs
+```
+
+Cerrar y eliminar el volumen anónimo local, que `down` por sí solo conserva:
+
+```bash
+docker compose -p resilient-task-demo -f aws/docker-compose.task-demo.yml down -v
+unset POSTGRES_PASSWORD IMAGE_TAG POSTGRES_IMAGE
+```
+
+La prueba local comprueba imágenes, loopback, orden y escenario. IAM, pull desde AWS y la salud real de Fargate quedan para la fase autorizada.
+
+Validación realizada el 29 de septiembre de 2026: las tres imágenes funcionaron en ARM64 y los tres contenedores quedaron saludables usando la misma red. `demo:start` y `demo:retry` conservaron la salida del baseline local; el escenario terminó `FINISHED`, intento 2, misma `EXT-78432` y una sola creación externa. La conexión SCRAM aceptó el password correcto y rechazó el incorrecto. Los 7 tests pasaron y el Compose original también quedó saludable con los Dockerfiles finales. Las muestras de memoria se registran en la sección 2; no hubo una prueba de carga.
+
+## 6. Inventario exacto propuesto
+
+| Recurso | Nombre / configuración |
+| --- | --- |
+| Región | `us-east-1`, confirmar en discovery |
+| ECR integration | `aws-community-day-resilient-integration`; privado, IMMUTABLE, scanOnPush, AES256 |
+| ECR external | `aws-community-day-external-api`; mismas opciones |
+| Logs | `/ecs/aws-community-day-resilient-integration`; retención 7 días; prefijos `integration`, `external`, `postgres` |
+| Execution role | `resilient-integration-execution-role`; política inline `resilient-integration-task-execution` |
+| Secreto | `aws-community-day/demo/postgres-password`; un password aleatorio de demo |
+| Security group nuevo | `resilient-integration-demo-sg`; sin ingress, solo egress TCP 443 IPv4 |
+| Cluster | `aws-community-day-demo` |
+| Task family | `resilient-integration-task`; revisión con tres contenedores |
+| Servicio | `resilient-integration-service`; una task, plataforma 1.4.0 |
+| Red reutilizada | Default VPC y subnet pública existente apta para ARM64; Internet Gateway existente |
+| Recursos administrados | ENI e IPv4 por task; `AWSServiceRoleForECS` solo si falta |
+
+No crear Default VPC si falta ni modificar rutas existentes sin nueva autorización. Account ID, VPC, subnet y ARN reales se obtienen por discovery y se mantienen fuera de Git.
+
+## 7. Discovery de solo lectura
+
+Después de completar las pruebas locales, comprobar identidad, región, Default VPC, DNS, subnet, rutas e Internet Gateway. No mostrar claves, tokens ni valores de secretos.
 
 ```bash
 aws --version
-aws sts get-caller-identity
+aws sts get-caller-identity --query '{Account:Account,Arn:Arn}' --output json
 aws configure get region
+export AWS_REGION=us-east-1
+export VPC_ID="$(aws ec2 describe-vpcs --region "$AWS_REGION" \
+  --filters Name=is-default,Values=true --query 'Vpcs[0].VpcId' --output text)"
+aws ec2 describe-vpc-attribute --vpc-id "$VPC_ID" --attribute enableDnsSupport --region "$AWS_REGION"
+aws ec2 describe-vpc-attribute --vpc-id "$VPC_ID" --attribute enableDnsHostnames --region "$AWS_REGION"
+aws ec2 describe-subnets --region "$AWS_REGION" --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query 'Subnets[].{SubnetId:SubnetId,AZ:AvailabilityZone,AZId:AvailabilityZoneId,PublicIP:MapPublicIpOnLaunch,State:State}'
+aws ec2 describe-route-tables --region "$AWS_REGION" --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query 'RouteTables[].{Id:RouteTableId,Associations:Associations,Routes:Routes}'
+aws ec2 describe-internet-gateways --region "$AWS_REGION" --filters "Name=attachment.vpc-id,Values=$VPC_ID"
+aws ecr get-registry-scanning-configuration --region "$AWS_REGION"
+aws iam get-role --role-name AWSServiceRoleForECS --query 'Role.Arn'
+aws iam get-role --role-name resilient-integration-execution-role --query 'Role.Arn'
+aws ecr describe-repositories --region "$AWS_REGION" \
+  --repository-names aws-community-day-resilient-integration aws-community-day-external-api
+aws logs describe-log-groups --region "$AWS_REGION" \
+  --log-group-name-prefix /ecs/aws-community-day-resilient-integration
+aws secretsmanager describe-secret --region "$AWS_REGION" \
+  --secret-id aws-community-day/demo/postgres-password
+aws ec2 describe-security-groups --region "$AWS_REGION" \
+  --filters "Name=vpc-id,Values=$VPC_ID" Name=group-name,Values=resilient-integration-demo-sg
+aws ecs describe-clusters --clusters aws-community-day-demo --region "$AWS_REGION"
 ```
 
-| Recurso futuro | Nombre propuesto | Condición |
-| --- | --- | --- |
-| Repositorio ECR privado | `aws-community-day-resilient-integration` | Una imagen `v1`; nuevos builds publicados con `v2`, `v3`, etc. |
-| CloudWatch Logs log group | `/ecs/aws-community-day-resilient-integration` | Retención propuesta: 7 días. |
-| IAM execution role | `resilient-integration-execution-role` | Pull ECR y escritura de logs; lectura del secreto solo si se usa. |
-| IAM task role | Ninguno inicialmente | El código no llama directamente a servicios AWS. |
-| ECS cluster | `aws-community-day-demo` | Fargate. |
-| Task definition family | `resilient-integration-task` | ARM64; una revisión por imagen/configuración. |
-| ECS service | `resilient-integration-service` | `desiredCount=1` **solo después** de resolver PostgreSQL. |
-| Password de PostgreSQL | Referencia a un secreto existente o futuro | Nunca valor en JSON versionado. |
-| Red | VPC, subnet y security group existentes | Sin cambios de red sin aprobación. |
+`NoSuchEntity` o `ResourceNotFoundException` puede confirmar ausencia. `AccessDenied` significa no comprobado. No sobrescribir recursos con el mismo nombre pertenecientes a otro proyecto.
 
-La región propuesta para la siguiente fase es la que confirme `aws configure get region` (en esta preparación figura `us-east-1`); todos los comandos la reciben por variable. Los costos dependerán de esa región y del tiempo de uso: [Fargate factura CPU y memoria por duración](https://aws.amazon.com/fargate/pricing/), [ECR cobra almacenamiento y transferencias aplicables](https://aws.amazon.com/ecr/pricing/), y [CloudWatch Logs cobra ingestión y almacenamiento según uso](https://aws.amazon.com/cloudwatch/pricing/). Si se asigna IPv4 pública, puede haber [cargo por IPv4](https://aws.amazon.com/vpc/pricing/); una NAT Gateway agrega cargo por hora y GB, y **no se propone crearla**. [Secrets Manager cobra por secreto y llamadas](https://aws.amazon.com/secrets-manager/pricing/); [Parameter Store estándar no tiene cargo adicional](https://aws.amazon.com/systems-manager/pricing/). Revisar precios vigentes y estimar con AWS Pricing Calculator antes de aprobar cualquier write.
+**Resultado de discovery: WARNING.** El intento de solo lectura, posterior a las pruebas locales, encontró AWS CLI 2.36.19 y región configurada `us-east-1`, pero STS respondió `InvalidClientTokenId`, VPC `AuthFailure` y ECR/ECS/Logs `UnrecognizedClientException`. El perfil SSO alternativo también tenía el token vencido y falló su refresh. Las credenciales deben renovarse antes de confirmar identidad, Default VPC, subnet, security groups, configuración de escaneo y recursos existentes. No se deduce su ausencia ni se guardan IDs reales. No se realizaron writes AWS.
 
-## 3. Variables para la fase de creación
+El escaneo ECR depende de la configuración efectiva del registro. [AWS recomienda configuración de escaneo a nivel de registro](https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-scanning-basic.html). Además de enviar `scanOnPush=true` al crear repositorios, comprobar que reglas BASIC/ENHANCED cubran ambos. Si no los cubren, documentar el cambio y obtener autorización antes de modificar una política que afecte otros repositorios.
 
-Ejecutar desde la raíz del repositorio. Los valores entre `<...>` son ejemplos deliberadamente incompletos; sustituirlos solo después de aprobar recursos y región. El account ID se obtiene de STS y no se guarda en Git.
+## 8. Variables de la fase futura
+
+Los siguientes bloques son referencia para **después de aprobar inventario y costos**. Requieren AWS CLI v2, `jq`, `envsubst`, `openssl` y `rg`. Ejecutar en Bash desde el commit limpio que se desplegará. Usar archivos temporales fuera de Git y no activar `set -x`.
 
 ```bash
-export AWS_REGION="$(aws configure get region)"
-export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-export ECR_REPOSITORY=aws-community-day-resilient-integration
-export IMAGE_TAG=v1
+set -euo pipefail
+export AWS_REGION=us-east-1
+AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+export AWS_ACCOUNT_ID
+export INTEGRATION_ECR_REPOSITORY=aws-community-day-resilient-integration
+export EXTERNAL_ECR_REPOSITORY=aws-community-day-external-api
+export IMAGE_TAG="demo-$(git rev-parse --short=8 HEAD)"
+export REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+export INTEGRATION_IMAGE_URI="${REGISTRY}/${INTEGRATION_ECR_REPOSITORY}:${IMAGE_TAG}"
+export EXTERNAL_IMAGE_URI="${REGISTRY}/${EXTERNAL_ECR_REPOSITORY}:${IMAGE_TAG}"
+export POSTGRES_IMAGE=postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+export POSTGRES_USER=demo
+export POSTGRES_DB=integration_demo
 export LOG_GROUP=/ecs/aws-community-day-resilient-integration
+export SECRET_NAME=aws-community-day/demo/postgres-password
+export EXECUTION_ROLE_NAME=resilient-integration-execution-role
+export EXECUTION_POLICY_NAME=resilient-integration-task-execution
 export ECS_CLUSTER=aws-community-day-demo
 export ECS_SERVICE=resilient-integration-service
 export TASK_FAMILY=resilient-integration-task
-export EXECUTION_ROLE_NAME=resilient-integration-execution-role
-export IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
+export VPC_ID='<DEFAULT_VPC_EXISTENTE>'
+export SUBNET_ID='<SUBNET_PUBLICA_EXISTENTE_NO_USE1_AZ3>'
+export TASK_ROLE_ARN=''
+umask 077
 ```
 
-La estrategia de tags es `v1`, `v2`, etc. con repositorio **IMMUTABLE**: cada versión señala una imagen concreta y no se reutiliza `v1` tras publicarla. No se usa `latest` para que la Task Definition conserve una referencia explicable y repetible. El script de build utiliza `v1` por defecto; el de push exige `IMAGE_TAG` explícito.
+Sustituir todos los `<...>` antes de ejecutar. El password no se exporta para AWS: ECS lo inyecta mediante el ARN del secreto. Para validar otra revisión PostgreSQL, actualizar el digest explícitamente y repetir las pruebas ARM64 y escenario.
 
-## 4. Construir y comprobar la imagen local
+## 9. Comandos futuros: ECR y publicación
 
 ```bash
-bash scripts/aws/build-image.sh
-docker image inspect --format '{{.Os}}/{{.Architecture}}' "${ECR_REPOSITORY}:${IMAGE_TAG}"
+aws ecr create-repository --repository-name "$INTEGRATION_ECR_REPOSITORY" \
+  --image-tag-mutability IMMUTABLE --image-scanning-configuration scanOnPush=true \
+  --encryption-configuration encryptionType=AES256 --region "$AWS_REGION"
+aws ecr create-repository --repository-name "$EXTERNAL_ECR_REPOSITORY" \
+  --image-tag-mutability IMMUTABLE --image-scanning-configuration scanOnPush=true \
+  --encryption-configuration encryptionType=AES256 --region "$AWS_REGION"
+bash scripts/aws/build-image.sh all
+bash scripts/aws/push-image.sh all
+aws ecr describe-images --repository-name "$INTEGRATION_ECR_REPOSITORY" \
+  --image-ids "imageTag=$IMAGE_TAG" --region "$AWS_REGION"
+aws ecr describe-images --repository-name "$EXTERNAL_ECR_REPOSITORY" \
+  --image-ids "imageTag=$IMAGE_TAG" --region "$AWS_REGION"
 ```
 
-La salida de arquitectura debe ser `linux/arm64`. El script construye desde la raíz con `apps/integration-service/Dockerfile`; no necesita acceso a AWS. Si se elige otra arquitectura en una fase posterior, cambiar **juntos** el build, la validación del script de push y `runtimePlatform` en la plantilla ECS.
-
-## 5. Crear el repositorio ECR privado
-
-**Comando futuro; requiere autorización antes de ejecutarlo:**
+Se puede pasar `integration-service` o `external-api` en lugar de `all`. El push valida ambas imágenes antes de autenticar/publicar. La autenticación entrega [`aws ecr get-login-password`](https://docs.aws.amazon.com/cli/latest/reference/ecr/get-login-password.html) por stdin a Docker. Login manual equivalente:
 
 ```bash
-aws ecr create-repository \
-  --repository-name "$ECR_REPOSITORY" \
-  --image-tag-mutability IMMUTABLE \
-  --region "$AWS_REGION"
+aws ecr get-login-password --region "$AWS_REGION" | \
+  docker login --username AWS --password-stdin "$REGISTRY"
 ```
 
-El repositorio debe existir antes de `docker push`. [AWS documenta el flujo crear repositorio → autenticar → etiquetar → publicar](https://docs.aws.amazon.com/AmazonECR/latest/userguide/getting-started-cli.html).
+Si un tag ya existe, comprobar el digest; no sobrescribir ni desactivar inmutabilidad. Un cambio de código requiere commit y tag nuevos.
 
-## 6. Autenticarse en ECR
-
-El script de publicación también ejecuta esta autenticación. Para hacerlo manualmente:
-
-```bash
-aws ecr get-login-password --region "$AWS_REGION" |
-  docker login --username AWS --password-stdin \
-    "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-```
-
-La [contraseña de login de ECR](https://docs.aws.amazon.com/cli/latest/reference/ecr/get-login-password.html) se entrega por stdin a Docker; no se imprime ni se versiona.
-
-## 7. Etiquetar y publicar la imagen
-
-**Comando futuro; requiere autorización antes de ejecutarlo:**
-
-```bash
-bash scripts/aws/push-image.sh
-```
-
-El script comprueba que la imagen local exista y sea ARM64, hace `docker login`, `docker tag` y `docker push` a `IMAGE_URI`. Si el tag `v1` ya existe en ECR inmutable, incrementar `IMAGE_TAG` y reconstruir antes de publicar.
-
-## 8. Crear CloudWatch Logs log group
-
-**Comandos futuros; requieren autorización:**
+## 10. Comandos futuros: logs, secreto e IAM
 
 ```bash
 aws logs create-log-group --log-group-name "$LOG_GROUP" --region "$AWS_REGION"
-aws logs put-retention-policy \
-  --log-group-name "$LOG_GROUP" \
-  --retention-in-days 7 \
+aws logs put-retention-policy --log-group-name "$LOG_GROUP" \
+  --retention-in-days 7 --region "$AWS_REGION"
+```
+
+Los tres contenedores usan `awslogs`, prefijos diferenciados y `mode=non-blocking`, `max-buffer-size=1m` explícitos. Si se llena el buffer pueden perderse logs; no se bloquea la aplicación por enviarlos. El grupo se crea antes: no se concede `logs:CreateLogGroup` a la task. [Opciones oficiales de awslogs](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_LogConfiguration.html).
+
+Crear **un solo secreto** cuyo valor sea un password aleatorio en texto plano de Secrets Manager, no un objeto JSON. Generarlo en archivo restringido, pasarlo al CLI y eliminarlo sin imprimirlo ni versionarlo:
+
+```bash
+create_demo_secret() (
+  set -euo pipefail
+  umask 077
+  secret_file="$(mktemp)"
+  trap 'rm -f "$secret_file"' EXIT
+  openssl rand -hex 32 | tr -d '\n' > "$secret_file"
+  aws secretsmanager create-secret \
+    --name "$SECRET_NAME" --secret-string "file://${secret_file}" \
+    --description 'Password aleatorio de PostgreSQL para demo temporal ECS' \
+    --query ARN --output text --region "$AWS_REGION"
+)
+POSTGRES_PASSWORD_SECRET_ARN="$(create_demo_secret)"
+export POSTGRES_PASSWORD_SECRET_ARN
+unset -f create_demo_secret
+```
+
+Se usa la clave administrada por AWS para Secrets Manager; no se crea una clave KMS. El mismo ARN se inyecta en `POSTGRES_PASSWORD` de PostgreSQL y `DATABASE_PASSWORD` de integración con `secrets[].valueFrom`. El valor no aparece en `environment`. Un cambio del secreto requiere nueva task para inyectarse.
+
+El execution role permite al agente ECS extraer las dos imágenes, escribir en este log group y leer este secreto. [AWS distingue estos permisos de los del código de aplicación](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_execution_IAM_role.html). No se agrega task role ni permisos administrativos. La política acota repositorios y secreto a sus ARN; `ecr:GetAuthorizationToken` requiere `Resource="*"`. No se agrega `kms:Decrypt` al usar la clave predeterminada.
+
+```bash
+aws iam create-role --role-name "$EXECUTION_ROLE_NAME" \
+  --assume-role-policy-document file://aws/execution-role-trust.json
+EXECUTION_ROLE_ARN="$(aws iam get-role --role-name "$EXECUTION_ROLE_NAME" \
+  --query Role.Arn --output text)"
+export EXECUTION_ROLE_ARN
+policy_file="$(mktemp)"
+envsubst '${AWS_REGION} ${AWS_ACCOUNT_ID} ${INTEGRATION_ECR_REPOSITORY} ${EXTERNAL_ECR_REPOSITORY} ${LOG_GROUP} ${POSTGRES_PASSWORD_SECRET_ARN}' \
+  < aws/execution-role-policy.template.json > "$policy_file"
+jq empty "$policy_file"
+aws iam put-role-policy --role-name "$EXECUTION_ROLE_NAME" \
+  --policy-name "$EXECUTION_POLICY_NAME" --policy-document "file://${policy_file}"
+rm -f "$policy_file"
+unset policy_file
+```
+
+El operador necesita permisos de creación/publicación sobre el inventario e `iam:PassRole` sobre este execution role; no se entregan al contenedor. Si falta `AWSServiceRoleForECS`, su creación requiere autorización e implica un recurso adicional:
+
+```bash
+aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com
+```
+
+## 11. Comandos futuros: security group y red
+
+Usar Default VPC y subnet pública existente con ruta activa `0.0.0.0/0` al Internet Gateway. Fargate recibe IPv4 pública para salir a ECR, CloudWatch, Secrets Manager y Docker Hub; [la subnet pública necesita `assignPublicIp=ENABLED`](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-task-networking.html). La comunicación de aplicación/base es loopback. El SG nuevo no tiene ingress, incluidos 3000, 3001 y 5432. No hay ALB ni endpoint público para ejecutar la demo desde Internet.
+
+```bash
+SECURITY_GROUP_ID="$(aws ec2 create-security-group \
+  --group-name resilient-integration-demo-sg \
+  --description 'Demo ECS temporal; sin ingress; egress HTTPS' \
+  --vpc-id "$VPC_ID" --query GroupId --output text --region "$AWS_REGION")"
+export SECURITY_GROUP_ID
+egress_json="$(aws ec2 describe-security-groups --group-ids "$SECURITY_GROUP_ID" \
+  --query 'SecurityGroups[0].IpPermissionsEgress' --output json --region "$AWS_REGION")"
+aws ec2 revoke-security-group-egress --group-id "$SECURITY_GROUP_ID" \
+  --ip-permissions "$egress_json" --region "$AWS_REGION"
+aws ec2 authorize-security-group-egress --group-id "$SECURITY_GROUP_ID" \
+  --ip-permissions '[{"IpProtocol":"tcp","FromPort":443,"ToPort":443,"IpRanges":[{"CidrIp":"0.0.0.0/0","Description":"HTTPS a registros AWS y Docker Hub"}]}]' \
   --region "$AWS_REGION"
+aws ec2 describe-security-groups --group-ids "$SECURITY_GROUP_ID" \
+  --query 'SecurityGroups[0].{Ingress:IpPermissions,Egress:IpPermissionsEgress}' --region "$AWS_REGION"
+unset egress_json
 ```
 
-El grupo se crea explícitamente: la task no necesita `logs:CreateLogGroup`. La configuración `awslogs` en la plantilla envía el `stdout`/`stderr` del contenedor al grupo y usa el prefijo `ecs`; AWS exige [grupo, región y prefijo para Fargate](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_LogConfiguration.html). Los logs de NestJS deben aparecer sin archivo local de logs.
+Un SG nuevo comienza sin ingress; verificar lista vacía. TCP 443 permite la salida HTTPS requerida. El resolver DNS de la VPC no se bloquea mediante security groups. No reutilizar el SG default ni modificar reglas preexistentes.
 
-## 9. Crear el IAM Task Execution Role
+## 12. Comandos futuros: registrar task y crear servicio
 
-**Comandos futuros; requieren autorización:**
-
-```bash
-aws iam create-role \
-  --role-name "$EXECUTION_ROLE_NAME" \
-  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-aws iam attach-role-policy \
-  --role-name "$EXECUTION_ROLE_NAME" \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-export EXECUTION_ROLE_ARN="$(aws iam get-role --role-name "$EXECUTION_ROLE_NAME" --query Role.Arn --output text)"
-```
-
-El **Task Execution Role** da permisos al agente ECS para extraer la imagen ECR y enviar logs. El **Task Role** entrega credenciales al código dentro del contenedor; aquí no se requiere, porque la aplicación no llama a APIs AWS. La [política gestionada de execution role](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_execution_IAM_role.html) cubre el caso básico sin permisos administrativos. Si se referencia un secreto, se agrega al execution role permiso de lectura **acotado a su ARN**; no al task role. No conceder `AdministratorAccess`.
-
-## 10. Resolver dependencias y referenciar el password
-
-**Detener aquí la ejecución futura si no hay un PostgreSQL aislado, autorizado y alcanzable desde la subnet de la task.** Configurar `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_NAME`, `DATABASE_USER` y un ARN real de Secrets Manager para `DATABASE_PASSWORD_SECRET_ARN`. Nunca escribir el password en `environment`, en comandos, en el repositorio ni en la imagen. La plantilla usa [`secrets[].valueFrom`](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html) para que ECS lo inyecte al arrancar. También se puede usar un ARN de Parameter Store SecureString; en ese caso el execution role necesita `ssm:GetParameters` sobre el parámetro en lugar de `secretsmanager:GetSecretValue`. Si se usa una clave KMS administrada por el cliente, se requiere además `kms:Decrypt` acotado a esa clave.
-
-Ejemplo de política **solo para un secreto de Secrets Manager ya creado**, sin valor del password:
+Renderizar solo placeholders declarados para preservar variables `$...` de healthchecks. Eliminar `taskRoleArn` vacío y revisar JSON antes de registrar:
 
 ```bash
-export DATABASE_PASSWORD_SECRET_ARN='<ARN_DEL_SECRETO>'
-aws iam put-role-policy \
-  --role-name "$EXECUTION_ROLE_NAME" \
-  --policy-name resilient-integration-db-password-read \
-  --policy-document "$(jq -n --arg arn "$DATABASE_PASSWORD_SECRET_ARN" '{Version:"2012-10-17",Statement:[{Effect:"Allow",Action:["secretsmanager:GetSecretValue"],Resource:$arn}]}')"
-```
-
-**Este comando también es futuro y requiere autorización.** No se crea ningún secreto en esta fase. `EXTERNAL_API_URL` debe ser no vacía para que NestJS arranque, pero al no trasladar `external-api` a AWS, no se deben ejecutar operaciones de negocio en la task. Si se usa una URL de prueba inaccesible, identificarla como tal y no presentar el healthcheck como prueba de conectividad externa. Un `/health` saludable demuestra que el proceso NestJS arrancó con PostgreSQL disponible, no que el escenario completo funcione en AWS.
-
-## 11. Registrar la ECS Task Definition
-
-La plantilla versionada está en [`aws/ecs-task-definition.template.json`](aws/ecs-task-definition.template.json). Contiene placeholders para `IMAGE_URI` (compuesto de account ID y región), `EXECUTION_ROLE_ARN`, `TASK_ROLE_ARN`, `LOG_GROUP`, `AWS_REGION`, configuración de PostgreSQL, `EXTERNAL_API_URL` y ARN del secreto. Su `healthCheck` llama a `127.0.0.1:$PORT/health` con Node 22. ECS [solo observa healthchecks declarados en la Task Definition](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/healthcheck.html), aunque la imagen incluya un `HEALTHCHECK` de Docker. `PORT=3000` debe coincidir con `portMappings.containerPort=3000`; si se modifica el puerto, cambiar ambos.
-
-**Comandos futuros; registrar requiere autorización y un secreto/base disponibles:**
-
-```bash
-export DATABASE_HOST='<HOST_POSTGRES_APROBADO>'
-export DATABASE_PORT=5432
-export DATABASE_NAME='<NOMBRE_BASE_DE_PRUEBA>'
-export DATABASE_USER='<USUARIO_DE_PRUEBA>'
-export EXTERNAL_API_URL='<URL_API_EXTERNA_SI_EXISTE>'
-export TASK_ROLE_ARN="${TASK_ROLE_ARN:-}"
-umask 077
-TASK_JSON="$(mktemp)"
-envsubst '${IMAGE_URI} ${EXECUTION_ROLE_ARN} ${TASK_ROLE_ARN} ${LOG_GROUP} ${AWS_REGION} ${DATABASE_HOST} ${DATABASE_PORT} ${DATABASE_NAME} ${DATABASE_USER} ${EXTERNAL_API_URL} ${DATABASE_PASSWORD_SECRET_ARN}' \
-  < aws/ecs-task-definition.template.json |
-  jq 'if .taskRoleArn == "" then del(.taskRoleArn) else . end' > "$TASK_JSON"
-jq empty "$TASK_JSON"
-aws ecs register-task-definition --cli-input-json "file://${TASK_JSON}" --region "$AWS_REGION"
-```
-
-`taskRoleArn` aparece como placeholder para uso futuro, pero [AWS indica que es opcional](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html); el `jq` lo elimina si está vacío. Revisar manualmente el JSON temporal antes de registrar para confirmar que no queden `<...>` ni `${...}`. Borrar ese archivo temporal al terminar. Si se publica una nueva imagen, registrar una nueva revisión con el nuevo tag.
-
-## 12. Crear cluster y ejecutar el servicio Fargate
-
-La task usa `awsvpc`: necesita subnet y security group existentes. Para extraer ECR desde una subnet pública se requiere ruta hacia Internet Gateway y `assignPublicIp=ENABLED`; en subnet privada, salida por NAT o VPC endpoints pertinentes. El security group de la task necesita salida HTTPS hacia ECR, CloudWatch Logs y el servicio de secretos elegido, además de salida al puerto de PostgreSQL; el security group de la base debe permitir la entrada desde el de la task. No se modifica ninguna red en esta fase. El healthcheck ocurre dentro del contenedor, por lo que no hace falta abrir `3000` a Internet; sin ALB no se ofrece un endpoint público de aplicación. [Requisitos de red de Fargate](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-tasks-services.html).
-
-**Comandos futuros; requieren autorización de recursos, red y acceso PostgreSQL:**
-
-```bash
-export SUBNET_ID='<SUBNET_PUBLICA_EXISTENTE>'
-export SECURITY_GROUP_ID='<SG_EXISTENTE_SIN_INGRESS_PUBLICO>'
+task_file="$(mktemp)"
+envsubst '${INTEGRATION_IMAGE_URI} ${EXTERNAL_IMAGE_URI} ${POSTGRES_IMAGE} ${EXECUTION_ROLE_ARN} ${TASK_ROLE_ARN} ${LOG_GROUP} ${AWS_REGION} ${POSTGRES_USER} ${POSTGRES_DB} ${POSTGRES_PASSWORD_SECRET_ARN}' \
+  < aws/ecs-task-definition.template.json | \
+  jq 'if .taskRoleArn == "" then del(.taskRoleArn) else . end' > "$task_file"
+jq empty "$task_file"
+if rg '\$\{|<[A-Z_]+>' "$task_file"; then
+  printf 'Quedan placeholders; revisar antes de registrar.\n' >&2
+  exit 1
+fi
+TASK_DEFINITION_ARN="$(aws ecs register-task-definition \
+  --cli-input-json "file://${task_file}" --query taskDefinition.taskDefinitionArn \
+  --output text --region "$AWS_REGION")"
+export TASK_DEFINITION_ARN
+rm -f "$task_file"
+unset task_file
 aws ecs create-cluster --cluster-name "$ECS_CLUSTER" --region "$AWS_REGION"
-aws ecs create-service \
-  --cluster "$ECS_CLUSTER" \
-  --service-name "$ECS_SERVICE" \
-  --task-definition "$TASK_FAMILY" \
-  --desired-count 1 \
-  --launch-type FARGATE \
-  --platform-version LATEST \
+aws ecs create-service --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" \
+  --task-definition "$TASK_DEFINITION_ARN" --desired-count 1 \
+  --launch-type FARGATE --platform-version 1.4.0 \
+  --deployment-configuration 'minimumHealthyPercent=0,maximumPercent=100,deploymentCircuitBreaker={enable=true,rollback=false}' \
   --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$SECURITY_GROUP_ID],assignPublicIp=ENABLED}" \
   --region "$AWS_REGION"
 ```
 
-Para subnet privada, usar `assignPublicIp=DISABLED` y una ruta de salida ya aprobada; no crear NAT ni endpoints en este alcance. Si PostgreSQL falta, **no crear el servicio**: `desiredCount=1` podría reemplazar repetidamente tasks que no arrancan y generar costos sin cumplir la prueba.
+Se usa la revisión exacta. El servicio reemplaza su única task sin mantener dos simultáneamente; para esta demo se acepta interrupción y pérdida de datos. El circuit breaker limita despliegues que no arrancan. No crear el servicio antes de confirmar red, secreto, IAM, imágenes y escaneo efectivo.
 
-## 13. Revisar estado de la task
+## 13. Comandos futuros: comprobar AWS
 
 ```bash
-aws ecs describe-services \
-  --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
-  --query 'services[0].{status:status,running:runningCount,desired:desiredCount,events:events[0:5]}' \
-  --region "$AWS_REGION"
-aws ecs list-tasks --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" --region "$AWS_REGION"
 aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$AWS_REGION"
-```
-
-`RUNNING` indica que el proceso está activo; comprobar también `healthStatus`. Los eventos de ECS y `stoppedReason` permiten distinguir error de imagen/red/IAM de error de aplicación.
-
-## 14. Revisar el healthcheck
-
-```bash
-TASK_ARN="$(aws ecs list-tasks --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" --query 'taskArns[0]' --output text --region "$AWS_REGION")"
-aws ecs describe-tasks \
-  --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
-  --query 'tasks[0].{lastStatus:lastStatus,healthStatus:healthStatus,containers:containers[].{name:name,health:healthStatus,exitCode:exitCode,reason:reason}}' \
-  --region "$AWS_REGION"
-```
-
-Esperar `HEALTHY` en la task y el contenedor. El comando usa el `fetch` incorporado en Node; no depende de `curl` ni `wget` en la imagen final. Si no existe una task activa, consultar también las tasks detenidas y eventos del servicio. Un `/health` HTTP 200 solo es posible después de conectar PostgreSQL durante el arranque.
-
-## 15. Revisar logs y resolver fallos básicos
-
-```bash
-aws logs tail "$LOG_GROUP" --since 30m --region "$AWS_REGION"
 aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
-  --query 'services[0].events[0:10].[createdAt,message]' --region "$AWS_REGION"
+  --query 'services[0].{status:status,running:runningCount,desired:desiredCount,events:events[0:5]}' --region "$AWS_REGION"
+export TASK_ARN="$(aws ecs list-tasks --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" \
+  --query 'taskArns[0]' --output text --region "$AWS_REGION")"
+aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
+  --query 'tasks[0].{status:lastStatus,health:healthStatus,platform:platformVersion,containers:containers[].{name:name,health:healthStatus,exitCode:exitCode,reason:reason},stoppedReason:stoppedReason}' \
+  --region "$AWS_REGION"
+aws logs tail "$LOG_GROUP" --since 30m --region "$AWS_REGION"
 ```
+
+Exigir task `RUNNING` y `HEALTHY`, los **tres** contenedores `HEALTHY`, PostgreSQL listo y NestJS iniciado en logs. `RUNNING` por sí solo no cumple. Si no hay task activa, listar detenidas con `--desired-status STOPPED`, consultar `stoppedReason` y eventos.
 
 | Síntoma | Comprobación |
 | --- | --- |
-| `CannotPullContainerError` | Imagen/tag ARM64 en ECR; execution role; ruta de red a ECR. |
-| `ResourceInitializationError` | Acceso al log group o secreto desde execution role; red hacia CloudWatch/Secrets Manager. |
-| NestJS no escucha `/health` | Variables `DATABASE_*`, DNS, security group y conectividad a PostgreSQL; mirar logs de TypeORM. |
-| `UNHEALTHY` | `PORT`, mapeo `3000`, comando healthcheck, tiempo de arranque y respuesta HTTP. |
-| Servicio reemplaza tasks | Revisar eventos y `stoppedReason`; detener/escala a cero si la dependencia no existe. |
+| `CannotPullContainerError` | SHA/tag, ARM64, IAM ECR, HTTPS/ruta pública; rate limit Docker Hub en PostgreSQL. |
+| `ResourceInitializationError` | Log group, secreto, execution role y HTTPS. |
+| Integración no arranca | `dependsOn`, salud de dependencias, `DATABASE_*`, logs TypeORM. |
+| `UNHEALTHY` | Acceso autenticado/`SELECT 1`, HTTP, puerto y memoria; no falsear `/health`. |
+| No se coloca task | AZ ID compatible ARM64, 512/2048, plataforma 1.4.0 y cuotas. |
+| Tasks reemplazadas | Revisar fallo y escalar a cero para investigar; cada reemplazo inicia PostgreSQL vacío. |
 
-ECS envía `SIGTERM` al detener una task y normalmente espera 30 segundos antes de `SIGKILL`; `stopTimeout: 30` lo expresa en la plantilla. El proceso Node debe ser PID 1 para recibir la señal. [Comportamiento oficial de StopTask](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_StopTask.html).
+Node recibe SIGTERM como PID 1; `stopTimeout=30` da tiempo al apagado. ECS [envía SIGTERM antes de forzar SIGKILL](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_StopTask.html). No se agrega ECS Exec ni acceso público para convertir la evidencia AWS en otra demo interactiva.
 
-## 16. Eliminar los recursos de la prueba
+## 14. Costos potenciales
 
-**Comandos destructivos de referencia para la fase posterior, solo tras confirmar el inventario real y su propietario.** Escalar a cero antes de borrar el servicio. Los comandos deben aplicarse únicamente a recursos creados para esta demo; no eliminar secretos o redes preexistentes.
+Referencia para `us-east-1`, Linux ARM64 on-demand, una task de 0,5 vCPU/2 GiB. Precios revisados el 29 de septiembre de 2026; sin impuestos, créditos ni Free Tier:
+
+| Concepto | Referencia |
+| --- | --- |
+| Fargate | Aproximadamente USD 0,02331/h por task. |
+| Una IPv4 pública | USD 0,005/h. |
+| Task + IPv4 | USD 0,02831/h; aproximadamente USD 0,057 para 2 horas. |
+| Disco efímero por defecto | 20 GiB incluidos, sin ampliación. |
+| ECR | USD 0,10/GB-mes por almacenamiento de las dos imágenes. |
+| CloudWatch Logs | USD 0,50/GB de ingestión y USD 0,03/GB-mes de almacenamiento. |
+| Secrets Manager | USD 0,40/secreto-mes prorrateado y USD 0,05/10 000 llamadas. |
+
+CPU/memoria derivan de [Fargate ARM64 para N. Virginia](https://aws.amazon.com/fargate/pricing/); IPv4 se cobra [según VPC](https://aws.amazon.com/vpc/pricing/). Se suman [ECR](https://aws.amazon.com/ecr/pricing/), [CloudWatch](https://aws.amazon.com/cloudwatch/pricing/), [Secrets Manager](https://aws.amazon.com/secrets-manager/pricing/) y transferencias aplicables. Escaneo ENHANCED puede agregar [Amazon Inspector](https://aws.amazon.com/inspector/pricing/). Un servicio `desiredCount=1` factura hasta detenerlo; 24 horas equivalen aproximadamente a USD 0,68 solo por task+IPv4. Repositorios, logs y secreto pueden seguir cobrando con el servicio detenido.
+
+## 15. Comandos futuros de limpieza
+
+Aplicar solo a recursos **creados e inventariados para esta demo**. Confirmar propietario y referencias antes de borrar. Escalar a cero y esperar que terminen las tasks y se libere su ENI:
 
 ```bash
-aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
-  --desired-count 0 --region "$AWS_REGION"
+task_arns="$(aws ecs list-tasks --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" \
+  --desired-status RUNNING --query taskArns --output text --region "$AWS_REGION")"
+aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --desired-count 0 --region "$AWS_REGION"
+if [[ -n "$task_arns" ]]; then
+  aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks $task_arns --region "$AWS_REGION"
+fi
 aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$AWS_REGION"
-aws ecs delete-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
-  --force --region "$AWS_REGION"
+aws ecs delete-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --force --region "$AWS_REGION"
 aws ecs wait services-inactive --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$AWS_REGION"
+aws ecs deregister-task-definition --task-definition "$TASK_DEFINITION_ARN" --region "$AWS_REGION"
 aws ecs delete-cluster --cluster "$ECS_CLUSTER" --region "$AWS_REGION"
+aws ec2 delete-security-group --group-id "$SECURITY_GROUP_ID" --region "$AWS_REGION"
 aws logs delete-log-group --log-group-name "$LOG_GROUP" --region "$AWS_REGION"
-aws ecr delete-repository --repository-name "$ECR_REPOSITORY" --force --region "$AWS_REGION"
-aws iam delete-role-policy --role-name "$EXECUTION_ROLE_NAME" \
-  --policy-name resilient-integration-db-password-read
-aws iam detach-role-policy --role-name "$EXECUTION_ROLE_NAME" \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+aws ecr delete-repository --repository-name "$INTEGRATION_ECR_REPOSITORY" --force --region "$AWS_REGION"
+aws ecr delete-repository --repository-name "$EXTERNAL_ECR_REPOSITORY" --force --region "$AWS_REGION"
+aws secretsmanager delete-secret --secret-id "$POSTGRES_PASSWORD_SECRET_ARN" \
+  --recovery-window-in-days 7 --region "$AWS_REGION"
+aws iam delete-role-policy --role-name "$EXECUTION_ROLE_NAME" --policy-name "$EXECUTION_POLICY_NAME"
 aws iam delete-role --role-name "$EXECUTION_ROLE_NAME"
+docker logout "$REGISTRY"
+unset task_arns
 ```
 
-El `delete-role-policy` aplica solo si se agregó esa política en el paso 10. Registrar las revisiones de Task Definition creadas y ejecutar `aws ecs deregister-task-definition --task-definition '<TASK_DEFINITION_ARN>' --region "$AWS_REGION"` por cada una si se desea retirarlas. Eliminar el archivo JSON temporal con `rm -f "$TASK_JSON"`. No se ejecutó ninguno de estos comandos durante AWS readiness.
+Si `delete-security-group` devuelve `DependencyViolation`, esperar a que se elimine la ENI administrada y repetir esa eliminación; no borrar una ENI manualmente. El secreto tiene ventana de recuperación de 7 días, sin eliminación forzada inmediata. Desregistrar otras revisiones propias si existieran. No eliminar Default VPC, subnet, Internet Gateway ni `AWSServiceRoleForECS`, que pueden ser compartidos. No se ejecuta ningún write de los bloques futuros durante esta preparación.

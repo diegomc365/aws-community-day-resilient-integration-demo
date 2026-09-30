@@ -2,14 +2,30 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ecr_repository="${ECR_REPOSITORY:-aws-community-day-resilient-integration}"
-image_tag="${IMAGE_TAG:-v1}"
-image="${ecr_repository}:${image_tag}"
+build_target="${1:-all}"
+revision="$(git -C "$repo_root" rev-parse HEAD)"
+short_sha="$(git -C "$repo_root" rev-parse --short=8 HEAD)"
+image_tag="${IMAGE_TAG:-demo-${short_sha}}"
+source_clean=true
+if [[ -n "$(git -C "$repo_root" status --porcelain)" ]]; then source_clean=false; fi
 
-docker build \
-  --platform linux/arm64 \
-  --file "${repo_root}/apps/integration-service/Dockerfile" \
-  --tag "${image}" \
-  "${repo_root}"
+build_image() {
+  local service="$1" repository="$2"
+  docker build --platform linux/arm64 \
+    --file "${repo_root}/apps/${service}/Dockerfile" \
+    --label "org.opencontainers.image.revision=${revision}" \
+    --label "demo.source-clean=${source_clean}" \
+    --tag "${repository}:${image_tag}" "$repo_root"
+  printf 'Imagen local: %s:%s (ARM64, checkout limpio=%s)\n' "$repository" "$image_tag" "$source_clean"
+}
 
-printf 'Imagen local lista: %s (linux/arm64)\n' "${image}"
+case "$build_target" in
+  integration-service|external-api|all) ;;
+  *) printf 'Uso: %s [integration-service|external-api|all]\n' "$0" >&2; exit 1 ;;
+esac
+if [[ "$build_target" != external-api ]]; then
+  build_image integration-service "${INTEGRATION_ECR_REPOSITORY:-aws-community-day-resilient-integration}"
+fi
+if [[ "$build_target" != integration-service ]]; then
+  build_image external-api "${EXTERNAL_ECR_REPOSITORY:-aws-community-day-external-api}"
+fi
